@@ -13,7 +13,6 @@ import (
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/jmespath/go-jmespath"
-	json "github.com/json-iterator/go"
 	"github.com/oschwald/geoip2-golang"
 	"github.com/oschwald/maxminddb-golang"
 	"github.com/prometheus/common/model"
@@ -55,10 +54,10 @@ var fields = map[GeoIPFields]string{
 
 // GeoIPConfig represents GeoIP stage config
 type GeoIPConfig struct {
-	DB     string            `river:"db,attr"`
-	Source *string           `river:"source,attr"`
-	DBType string            `river:"db_type,attr,optional"`
-	Values map[string]string `river:"values,attr,optional"`
+	DB            string            `river:"db,attr"`
+	Source        *string           `river:"source,attr"`
+	DBType        string            `river:"db_type,attr,optional"`
+	CustomLookups map[string]string `river:"custom_lookups,attr,optional"`
 }
 
 func validateGeoIPConfig(c GeoIPConfig) (map[string]*jmespath.JMESPath, error) {
@@ -69,7 +68,7 @@ func validateGeoIPConfig(c GeoIPConfig) (map[string]*jmespath.JMESPath, error) {
 		return nil, ErrEmptySourceGeoIPStageConfig
 	}
 
-	if c.DBType == "" && c.Values == nil {
+	if c.DBType == "" && c.CustomLookups == nil {
 		return nil, ErrEmptyDBTypeAndValuesGeoIPStageConfig
 	}
 
@@ -79,9 +78,9 @@ func validateGeoIPConfig(c GeoIPConfig) (map[string]*jmespath.JMESPath, error) {
 		return nil, ErrEmptyDBTypeGeoIPStageConfig
 	}
 
-	if c.Values != nil {
+	if c.CustomLookups != nil {
 		expressions := map[string]*jmespath.JMESPath{}
-		for key, expr := range c.Values {
+		for key, expr := range c.CustomLookups {
 			var err error
 			jmes := expr
 
@@ -107,18 +106,12 @@ func newGeoIPStage(logger log.Logger, config GeoIPConfig) (Stage, error) {
 		return nil, err
 	}
 
-	db, err := geoip2.Open(config.DB)
-	if err != nil {
-		return nil, err
-	}
-
 	mmdb, err := maxminddb.Open(config.DB)
 	if err != nil {
 		return nil, err
 	}
 
 	return &geoIPStage{
-		db:                db,
 		mmdb:              mmdb,
 		logger:            logger,
 		cfgs:              config,
@@ -128,7 +121,6 @@ func newGeoIPStage(logger log.Logger, config GeoIPConfig) (Stage, error) {
 
 type geoIPStage struct {
 	logger            log.Logger
-	db                *geoip2.Reader
 	mmdb              *maxminddb.Reader
 	cfgs              GeoIPConfig
 	valuesExpressions map[string]*jmespath.JMESPath
@@ -179,60 +171,32 @@ func (g *geoIPStage) process(labels model.LabelSet, extracted map[string]interfa
 	if g.cfgs.DBType != "" {
 		switch g.cfgs.DBType {
 		case "city":
-			record, err := g.db.City(ip)
+			var record geoip2.City
+			err := g.mmdb.Lookup(ip, &record)
 			if err != nil {
 				level.Error(g.logger).Log("msg", "unable to get City record for the ip", "err", err, "ip", ip)
 				return
 			}
-			g.populateLabelsWithCityData(labels, record)
+			g.populateLabelsWithCityData(labels, &record)
 		case "asn":
-			record, err := g.db.ASN(ip)
+			var record geoip2.ASN
+			err := g.mmdb.Lookup(ip, &record)
 			if err != nil {
 				level.Error(g.logger).Log("msg", "unable to get ASN record for the ip", "err", err, "ip", ip)
 				return
 			}
-			g.populateLabelsWithASNData(labels, record)
+			g.populateLabelsWithASNData(labels, &record)
 		default:
 			level.Error(g.logger).Log("msg", "unknown database type")
 		}
 	}
 
 	if g.valuesExpressions != nil {
-		var record any
-		if err := g.mmdb.Lookup(ip, &record); err != nil {
-			level.Error(g.logger).Log("msg", "unable to lookup record for the ip", "err", err, "ip", ip)
-			return
-		}
-
-		b, err := json.Marshal(record)
-		if err != nil {
-			level.Error(g.logger).Log("msg", "unable to json marshal record for the ip", "err", err, "ip", ip)
-			return
-		}
-		var data any
-		if err := json.Unmarshal(b, &data); err != nil {
-			if Debug {
-				level.Error(g.logger).Log("msg", "failed to unmarshal record", "err", err)
-			}
-			return
-		}
-		for key, expr := range g.valuesExpressions {
-			r, err := expr.Search(data)
-			if err != nil {
-				level.Error(g.logger).Log("msg", "failed to search JMES expression", "err", err)
-				continue
-			}
-			if r != nil {
-				labels[model.LabelName(key)] = model.LabelValue(fmt.Sprint(r))
-			}
-		}
+		g.extractCustomFields(ip, labels)
 	}
 }
 
 func (g *geoIPStage) close() {
-	if err := g.db.Close(); err != nil {
-		level.Error(g.logger).Log("msg", "error while closing geoip db", "err", err)
-	}
 	if err := g.mmdb.Close(); err != nil {
 		level.Error(g.logger).Log("msg", "error while closing mmdb", "err", err)
 	}
@@ -307,5 +271,24 @@ func (g *geoIPStage) populateLabelsWithASNData(labels model.LabelSet, record *ge
 	}
 	if autonomousSystemOrganization != "" {
 		labels[model.LabelName("geoip_autonomous_system_organization")] = model.LabelValue(autonomousSystemOrganization)
+	}
+}
+
+func (g *geoIPStage) extractCustomFields(ip net.IP, labels model.LabelSet) {
+	var record any
+	if err := g.mmdb.Lookup(ip, &record); err != nil {
+		level.Error(g.logger).Log("msg", "unable to lookup record for the ip", "err", err, "ip", ip)
+		return
+	}
+
+	for key, expr := range g.valuesExpressions {
+		r, err := expr.Search(record)
+		if err != nil {
+			level.Error(g.logger).Log("msg", "failed to search JMES expression", "err", err)
+			continue
+		}
+		if r != nil {
+			labels[model.LabelName(key)] = model.LabelValue(fmt.Sprint(r))
+		}
 	}
 }
